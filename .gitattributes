@@ -1,0 +1,11 @@
+# Force Windows line endings for .bat files
+*.bat text eol=crlf
+
+# Keep shell scripts with LF
+*.sh text eol=lf
+
+# Text files
+*.md text eol=lf
+*.txt text eol=lf
+*.py text eol=lf
+*.json text eol=lf
