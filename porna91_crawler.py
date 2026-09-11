@@ -79,28 +79,47 @@ async def crawl(keyword: str, max_items: int, download: bool, out_dir: str):
         page = await context.new_page()
         page.on("request", on_request)
 
-        search_url = f"https://91porna.com/comic/index/search?keyword={keyword}"
-        print(f"搜索页面: {search_url}")
-        await page.goto(search_url, wait_until="networkidle", timeout=60000)
-        await asyncio.sleep(random.uniform(2.0, 3.5))
-
-        # 获取详情链接
-        links = await page.eval_on_selector_all(
-            'a[href*="/comic/index/detail?video_key="]',
-            "els => els.map(e => ({href: e.href}))"
-        )
-
         targets = []
         seen = set()
-        for link in links:
-            m = re.search(r"video_key=(\d+)", link["href"])
-            if m:
-                vk = m.group(1)
-                if vk not in seen:
-                    seen.add(vk)
-                    targets.append({"video_key": vk, "detail_url": link["href"]})
+        page_num = 1
+        max_pages = 50  # 安全上限，防止无限翻页
 
-        print(f"发现 {len(targets)} 个短剧")
+        while len(targets) < max_items and page_num <= max_pages:
+            if page_num == 1:
+                url = f"https://91porna.com/comic/index/search?keyword={keyword}"
+            else:
+                url = f"https://91porna.com/comic/index/search?keyword={keyword}&page={page_num}"
+
+            print(f"正在访问第 {page_num} 页...")
+            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await asyncio.sleep(random.uniform(1.5, 2.8))
+
+            links = await page.eval_on_selector_all(
+                'a[href*="/comic/index/detail?video_key="]',
+                "els => els.map(e => ({href: e.href}))"
+            )
+
+            new_count = 0
+            for link in links:
+                m = re.search(r"video_key=(\d+)", link["href"])
+                if m:
+                    vk = m.group(1)
+                    if vk not in seen:
+                        seen.add(vk)
+                        targets.append({"video_key": vk, "detail_url": link["href"]})
+                        new_count += 1
+                        if len(targets) >= max_items:
+                            break
+
+            print(f"  第 {page_num} 页新增 {new_count} 个，当前共 {len(targets)} 个")
+
+            if new_count == 0:
+                print("  本页没有新内容，停止翻页")
+                break
+
+            page_num += 1
+
+        print(f"最终收集到 {len(targets)} 个短剧（已翻 {page_num-1} 页）")
         targets = targets[:max_items]
 
         results = []
