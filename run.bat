@@ -17,8 +17,14 @@ title 91porna 一键工具
 :: 文件会尽量使用网站原标题命名。
 :: ============================================================
 
-chcp 65001 >nul
-title 91porna 一键工具
+cd /d "%~dp0"
+
+where python >nul 2>nul
+if not %errorlevel%==0 (
+    echo [错误] 未检测到 python，请先安装 Python 并勾选 "Add to PATH"，再运行 install.bat
+    pause
+    exit /b
+)
 
 echo =====================================================
 echo   91porna 短剧工具（抓取 + 下载）
@@ -37,14 +43,19 @@ if "%num%"=="" set num=5
 
 echo.
 echo 正在抓取 "%keyword%"，共抓取 %num% 个...
+if exist "captured_91porna.json" del /q "captured_91porna.json"
 python porna91_crawler.py -k "%keyword%" -n %num%
+if not %errorlevel%==0 goto crawl_failed
+if not exist "captured_91porna.json" goto crawl_failed
+goto crawl_ok
 
-if not exist "captured_91porna.json" (
-    echo.
-    echo 抓取失败或没有结果，程序结束。
-    pause
-    exit /b
-)
+:crawl_failed
+echo.
+echo 抓取失败或没有结果，程序结束。
+pause
+exit /b
+
+:crawl_ok
 
 echo.
 echo 地址抓取完成！
@@ -64,31 +75,33 @@ echo.
 echo 正在检测 ffmpeg...
 
 where ffmpeg >nul 2>nul
-if %errorlevel% neq 0 (
-    echo.
-    echo [警告] 未检测到 ffmpeg！
-    echo.
-    echo 强烈建议安装 ffmpeg，否则：
-    echo - 只能生成 .ts 文件
-    echo - 可能出现音画不同步问题
-    echo - 无法自动转成 .mp4
-    echo.
-    echo 推荐安装方式：
-    echo 1. 访问 https://www.gyan.dev/ffmpeg/builds/
-    echo 2. 下载 "ffmpeg-release-essentials.zip"
-    echo 3. 解压后把 bin 文件夹加入系统环境变量 PATH
-    echo 4. 重启命令行窗口后再运行
-    echo.
-    set /p continue=是否继续只生成 .ts 文件？(Y/N): 
-    if /i not "%continue%"=="Y" (
-        echo 已取消。
-        pause
-        exit /b
-    )
-) else (
-    echo 检测到 ffmpeg，将自动转成 .mp4
-)
+if %errorlevel%==0 goto has_ffmpeg
 
+echo.
+echo [警告] 未检测到 ffmpeg！
+echo.
+echo 强烈建议安装 ffmpeg，否则：
+echo - 只能生成 .ts 文件
+echo - 可能出现音画不同步问题
+echo - 无法自动转成 .mp4
+echo.
+echo 推荐安装方式：
+echo 1. 访问 https://www.gyan.dev/ffmpeg/builds/
+echo 2. 下载 "ffmpeg-release-essentials.zip"
+echo 3. 解压后把 bin 文件夹加入系统环境变量 PATH
+echo 4. 重启命令行窗口后再运行
+echo.
+set continue=
+set /p continue=是否继续只生成 .ts 文件？[Y/N]: 
+if /i "%continue%"=="Y" goto start_download
+echo 已取消。
+pause
+exit /b
+
+:has_ffmpeg
+echo 检测到 ffmpeg，将自动转成 .mp4
+
+:start_download
 echo.
 echo 开始下载到 "%outdir%" ...
 python windows_full_downloader.py --from-json captured_91porna.json --out "%outdir%"

@@ -25,8 +25,8 @@
 
 工具会自动：
 - 先抓取 m3u8 地址
-- 再下载视频
-- 自动调用 ffmpeg 转成 `.mp4`（如果检测到 ffmpeg）
+- 再下载视频（支持 AES-128 加密的分片，自动解密；多线程下载，失败自动重试）
+- 有 ffmpeg 时直接输出 `.mp4`，没有 ffmpeg 时只能输出 `.ts`
 
 ---
 
@@ -50,15 +50,16 @@ python windows_full_downloader.py --from-json captured_91porna.json --out "D:\�
 
 下载 `ffmpeg-release-essentials.zip`，解压后把 `bin` 文件夹加入系统环境变量。
 
-装完后可以自动把 `.ts` 转成 `.mp4`。
+装完后下载结果会直接是 `.mp4`。
 
 ---
 
 ## 注意事项
 
-- 第一次必须运行 `install.bat`
+- 第一次必须运行 `install.bat`（会安装 playwright、httpx、pycryptodome 并下载 Chromium）
 - 建议一次不要抓太多（`-n` 建议 4~8）
-- 文件会尽量使用网站原标题
+- 文件会尽量使用网站原标题，只去掉 Windows 不允许出现在文件名里的字符
+- 已经下载过的（同名 `.mp4` 或 `.ts` 已存在）会自动跳过
 - 音画不同步属于网站本身问题，可用 ffmpeg 重新封装修复
 
 有问题随时问。

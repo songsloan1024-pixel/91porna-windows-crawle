@@ -20,8 +20,15 @@ import json
 import random
 import re
 import argparse
+import sys
 from pathlib import Path
+from urllib.parse import quote
 from playwright.async_api import async_playwright
+
+# Windows 控制台默认 GBK，避免打印特殊字符时报错
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 CAPTURED = []
 
@@ -59,7 +66,7 @@ async def get_title_from_detail(page, detail_url: str) -> str:
                     el = await page.query_selector(sel)
                     t = await el.inner_text() if el else ""
                 
-                if t and len(t.strip()) > 6 and "91" not in t:
+                if t and len(t.strip()) > 6 and "91porna" not in t.lower():
                     return t.strip()[:80]
             except:
                 continue
@@ -68,7 +75,9 @@ async def get_title_from_detail(page, detail_url: str) -> str:
     return ""
 
 async def crawl(keyword: str, max_items: int, download: bool, out_dir: str):
-    Path(out_dir).mkdir(exist_ok=True)
+    if download:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+    kw = quote(keyword)
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
@@ -86,9 +95,9 @@ async def crawl(keyword: str, max_items: int, download: bool, out_dir: str):
 
         while len(targets) < max_items and page_num <= max_pages:
             if page_num == 1:
-                url = f"https://91porna.com/comic/index/search?keyword={keyword}"
+                url = f"https://91porna.com/comic/index/search?keyword={kw}"
             else:
-                url = f"https://91porna.com/comic/index/search?keyword={keyword}&page={page_num}"
+                url = f"https://91porna.com/comic/index/search?keyword={kw}&page={page_num}"
 
             print(f"正在访问第 {page_num} 页...")
             await page.goto(url, wait_until="networkidle", timeout=60000)
@@ -127,9 +136,16 @@ async def crawl(keyword: str, max_items: int, download: bool, out_dir: str):
         for i, t in enumerate(targets, 1):
             print(f"\n[{i}/{len(targets)}] 处理 VID={t['video_key']}")
 
+            # 记录本轮开始前已捕获的数量，只把之后新捕获到的 m3u8 归到这个视频
+            capture_start = len(CAPTURED)
+
             # 访问 embed 页触发播放器
             embed = f"https://91porna.com/comic/index/embed?id={t['video_key']}"
-            await page.goto(embed, wait_until="domcontentloaded", timeout=25000)
+            try:
+                await page.goto(embed, wait_until="domcontentloaded", timeout=25000)
+            except Exception as e:
+                print(f"  打开播放页失败: {e}")
+                continue
             await asyncio.sleep(random.uniform(3.5, 5.5))
 
             # 尝试点击播放
@@ -145,9 +161,9 @@ async def crawl(keyword: str, max_items: int, download: bool, out_dir: str):
                 title = f"video-{t['video_key']}"
 
             # 收集本次访问捕获到的 m3u8
-            this_round = [c for c in CAPTURED if t['video_key'] in (c.get("referer") or "")]
-            if not this_round and CAPTURED:
-                this_round = CAPTURED[-1:]   # fallback
+            this_round = CAPTURED[capture_start:]
+            if not this_round:
+                print(f"  未捕获到 m3u8，跳过 VID={t['video_key']}")
 
             for item in this_round:
                 results.append({
@@ -161,12 +177,12 @@ async def crawl(keyword: str, max_items: int, download: bool, out_dir: str):
 
         await browser.close()
 
-    # 去重
+    # 去重：同一个视频只保留第一条 m3u8（同一视频常被捕获多次，仅 auth_key 参数不同）
     seen = set()
     final = []
     for r in results:
-        if r["m3u8_url"] not in seen:
-            seen.add(r["m3u8_url"])
+        if r["video_key"] not in seen:
+            seen.add(r["video_key"])
             final.append(r)
 
     # 保存结果
@@ -207,4 +223,7 @@ if __name__ == "__main__":
     parser.add_argument("--out", default="downloads")
     args = parser.parse_args()
 
-    asyncio.run(crawl(args.keyword, args.max, args.download, args.out))
+    final = asyncio.run(crawl(args.keyword, args.max, args.download, args.out))
+    if not final:
+        print("没有抓到任何 m3u8 地址。")
+        sys.exit(1)

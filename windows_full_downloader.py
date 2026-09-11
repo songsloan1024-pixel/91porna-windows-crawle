@@ -32,13 +32,37 @@ import shutil
 import tempfile
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+import re
 import sys
+
+# Windows 控制台默认 GBK，避免打印 ✓ 等字符时报错
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 try:
     import httpx
 except ImportError:
     print("请先安装 httpx: pip install httpx")
     sys.exit(1)
+
+try:
+    from Crypto.Cipher import AES
+except ImportError:
+    AES = None  # 遇到 AES-128 加密的 m3u8 时再提示安装
+
+
+CONCURRENCY = 8   # 同时下载的分片数
+RETRIES = 3       # 每个分片最多重试次数
+
+_ILLEGAL_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+def sanitize_filename(name: str, max_len: int = 150) -> str:
+    """去掉 Windows 文件名非法字符，保留其余原标题"""
+    name = _ILLEGAL_CHARS.sub(" ", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name[:max_len].rstrip(" .")
 
 
 def find_ffmpeg():
@@ -58,8 +82,32 @@ def find_ffmpeg():
     return None
 
 
+def parse_ext_x_key(line: str, base_url: str) -> dict | None:
+    """解析 #EXT-X-KEY 标签，返回 {method, uri, iv}"""
+    attrs = {}
+    for m in re.finditer(r'([A-Z0-9-]+)=("([^"]*)"|([^,]*))', line.split(":", 1)[1]):
+        attrs[m.group(1)] = m.group(3) if m.group(3) is not None else m.group(4)
+    method = attrs.get("METHOD", "NONE").upper()
+    if method == "NONE":
+        return None
+    iv = attrs.get("IV")
+    if iv:
+        iv = bytes.fromhex(iv[2:] if iv.lower().startswith("0x") else iv).rjust(16, b"\x00")
+    return {"method": method, "uri": urljoin(base_url, attrs.get("URI", "")), "iv": iv}
+
+
+def decrypt_segment(data: bytes, key: bytes, iv: bytes) -> bytes:
+    """AES-128-CBC 解密一个分片，并去掉 PKCS7 填充"""
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    plain = cipher.decrypt(data)
+    pad = plain[-1] if plain else 0
+    if 1 <= pad <= 16 and plain.endswith(bytes([pad]) * pad):
+        plain = plain[:-pad]
+    return plain
+
+
 async def download_m3u8_segments(m3u8_url: str, output_dir: Path, client: httpx.AsyncClient) -> list[Path]:
-    """下载 m3u8 及其所有 ts 分片"""
+    """下载 m3u8 及其所有 ts 分片（支持 AES-128 加密）"""
     print(f"  正在解析播放列表...")
     resp = await client.get(m3u8_url)
     if resp.status_code != 200:
@@ -69,38 +117,84 @@ async def download_m3u8_segments(m3u8_url: str, output_dir: Path, client: httpx.
     content = resp.text
     base_url = str(resp.url).rsplit("/", 1)[0] + "/"
 
+    # 每个分片记录 (url, key_info)，key_info 为 None 表示未加密
     segments = []
+    current_key = None
+    media_sequence = 0
     for line in content.splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
+        if not line:
             continue
-        seg_url = urljoin(base_url, line)
-        segments.append(seg_url)
+        if line.startswith("#EXT-X-KEY"):
+            current_key = parse_ext_x_key(line, base_url)
+            continue
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE"):
+            media_sequence = int(line.split(":", 1)[1].strip() or 0)
+            continue
+        if line.startswith("#"):
+            continue
+        segments.append((urljoin(base_url, line), current_key))
 
     if not segments:
         print("  播放列表中没有找到分片")
         return []
 
+    # 预先获取所有用到的密钥
+    key_cache: dict[str, bytes] = {}
+    for _, key_info in segments:
+        if key_info and key_info["uri"] not in key_cache:
+            if key_info["method"] != "AES-128":
+                print(f"  不支持的加密方式: {key_info['method']}")
+                return []
+            if AES is None:
+                print("  该视频为 AES-128 加密，请先安装依赖: pip install pycryptodome")
+                return []
+            kr = await client.get(key_info["uri"], timeout=30)
+            if kr.status_code != 200 or len(kr.content) != 16:
+                print(f"  获取解密密钥失败: {kr.status_code}")
+                return []
+            key_cache[key_info["uri"]] = kr.content
+    if key_cache:
+        print("  检测到 AES-128 加密，已获取密钥，下载时自动解密")
+
     print(f"  共 {len(segments)} 个分片，开始下载...")
 
-    segment_files = []
-    for i, seg_url in enumerate(segments, 1):
-        seg_name = f"seg_{i:05d}.ts"
-        seg_path = output_dir / seg_name
+    sem = asyncio.Semaphore(CONCURRENCY)
+    done = 0
 
-        try:
-            r = await client.get(seg_url, timeout=30)
-            if r.status_code == 200:
-                seg_path.write_bytes(r.content)
-                segment_files.append(seg_path)
-                if i % 20 == 0:
-                    print(f"    已下载 {i}/{len(segments)}")
-            else:
-                print(f"    分片下载失败: {seg_url}")
-        except Exception as e:
-            print(f"    下载分片出错: {e}")
+    async def fetch_one(i: int, seg_url: str, key_info: dict | None) -> Path | None:
+        nonlocal done
+        seg_path = output_dir / f"seg_{i:05d}.ts"
+        async with sem:
+            for attempt in range(1, RETRIES + 1):
+                try:
+                    r = await client.get(seg_url, timeout=30)
+                    if r.status_code == 200 and r.content:
+                        data = r.content
+                        if key_info:
+                            # 未指定 IV 时，按 HLS 规范用媒体序号作为 IV
+                            iv = key_info["iv"] or (media_sequence + i - 1).to_bytes(16, "big")
+                            data = decrypt_segment(data, key_cache[key_info["uri"]], iv)
+                        seg_path.write_bytes(data)
+                        done += 1
+                        if done % 20 == 0 or done == len(segments):
+                            print(f"    已下载 {done}/{len(segments)}")
+                        return seg_path
+                    print(f"    分片 {i} 返回 {r.status_code}（第 {attempt} 次）")
+                except Exception as e:
+                    print(f"    分片 {i} 出错: {e}（第 {attempt} 次）")
+                await asyncio.sleep(1.5 * attempt)
+        return None
 
-    return segment_files
+    results = await asyncio.gather(
+        *(fetch_one(i, url, key) for i, (url, key) in enumerate(segments, 1))
+    )
+    missing = [i for i, r in enumerate(results, 1) if r is None]
+    if missing:
+        print(f"  有 {len(missing)} 个分片下载失败（例如第 {missing[0]} 片），为避免生成残缺视频，本条放弃。请稍后重试。")
+        return []
+
+    return list(results)
 
 
 def merge_with_ffmpeg(segment_files: list[Path], output_file: Path, ffmpeg_path: str):
@@ -113,17 +207,20 @@ def merge_with_ffmpeg(segment_files: list[Path], output_file: Path, ffmpeg_path:
             f.write(f"file '{seg.as_posix()}'\n")
 
     cmd = [
-        ffmpeg_path,
+        ffmpeg_path, "-y",
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_file),
         "-c", "copy",
+        "-movflags", "+faststart",
         str(output_file)
     ]
 
     print(f"  使用 ffmpeg 合并 → {output_file.name}")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # ffmpeg 输出里带中文文件名，必须按 UTF-8 解码，否则 Windows 默认 GBK 会报错
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
         if result.returncode == 0:
             print(f"  ✓ 合并成功: {output_file}")
             return True
@@ -138,13 +235,17 @@ async def download_one_drama(item: dict, out_dir: Path, ffmpeg_path: str | None)
     title = item.get("title", f"video_{item.get('video_key', 'unknown')}")
     m3u8_url = item["m3u8_url"]
 
-    # 直接使用原标题
-    safe_title = title.strip()
-    output_file = out_dir / f"{safe_title}.ts"
+    # 尽量保留原标题，只去掉 Windows 文件名不允许的字符
+    safe_title = sanitize_filename(title) or f"video_{item.get('video_key', 'unknown')}"
+    # 有 ffmpeg 直接输出 .mp4，没有则只能输出 .ts
+    mp4_file = out_dir / f"{safe_title}.mp4"
+    ts_file = out_dir / f"{safe_title}.ts"
+    output_file = mp4_file if ffmpeg_path else ts_file
 
-    if output_file.exists():
-        print(f"已存在，跳过: {output_file.name}")
-        return
+    for existing in (mp4_file, ts_file):
+        if existing.exists():
+            print(f"已存在，跳过: {existing.name}")
+            return
 
     print(f"\n下载: {safe_title}")
 
@@ -164,10 +265,11 @@ async def download_one_drama(item: dict, out_dir: Path, ffmpeg_path: str | None)
             if not success:
                 # 降级：简单二进制拼接
                 print("  ffmpeg 失败，尝试简单拼接...")
-                with open(output_file, "wb") as out:
+                output_file.unlink(missing_ok=True)
+                with open(ts_file, "wb") as out:
                     for seg in segments:
                         out.write(seg.read_bytes())
-                print(f"  简单拼接完成: {output_file}")
+                print(f"  简单拼接完成: {ts_file}")
         else:
             print("  未检测到 ffmpeg，使用简单二进制拼接（可能有音画问题）")
             with open(output_file, "wb") as out:
